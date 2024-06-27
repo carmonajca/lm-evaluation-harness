@@ -35,9 +35,19 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
+try:
+    import intel_extension_for_pytorch as ipex
+
+    gpus = torch.xpu.device_count()
+except:
+    try:
+        gpus = torch.cuda.device_count()
+    except:
+        gpus = torch.npu.device_count()
+
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
 
 eval_logger = utils.eval_logger
-
 
 def _get_accelerate_args(
     device_map_option: Optional[str] = "auto",
@@ -68,7 +78,7 @@ def _get_accelerate_args(
 class HFLM(TemplateLM):
     """
     An abstracted Huggingface model class. Enables usage with both models of
-    `transformers.AutoModelForCausalLM` and `transformers.AutoModelForSeq2SeqLM` classes.
+    `AutoModelForCausalLM` and `AutoModelForSeq2SeqLM` classes.
 
     Supports data-parallel multi-GPU with HF Accelerate.
     """
@@ -93,7 +103,7 @@ class HFLM(TemplateLM):
         truncation: Optional[bool] = False,
         logits_cache: bool = True,
         max_length: Optional[int] = None,
-        device: Optional[str] = "cuda",
+        device: Optional[str] = "cpu",
         dtype: Optional[Union[str, torch.dtype]] = "auto",
         batch_size: Optional[Union[int, str]] = 1,
         max_batch_size: Optional[int] = 64,
@@ -125,7 +135,6 @@ class HFLM(TemplateLM):
             self._model = pretrained
             self._device = self._model.device
             self._config = self._model.config
-            gpus = 0
 
             if tokenizer:
                 assert isinstance(
@@ -147,19 +156,16 @@ class HFLM(TemplateLM):
             assert isinstance(pretrained, str)
             assert isinstance(batch_size, (int, str))
 
-            gpus = torch.cuda.device_count()
             accelerator_kwargs = InitProcessGroupKwargs(timeout=timedelta(weeks=52))
             accelerator = Accelerator(kwargs_handlers=[accelerator_kwargs])
             if accelerator.num_processes > 1:
                 self.accelerator = accelerator
 
-            if "npu" in accelerator.device.type:
-                gpus = torch.npu.device_count()
-
             if not (parallelize or accelerator.num_processes > 1):
                 # use user-passed device
                 device_list = set(
-                    ["cuda", "cpu"]
+                    ["cuda", "cpu", "xpu"]
+                    + [f"xpu:{i}" for i in range(gpus)]
                     + [f"cuda:{i}" for i in range(gpus)]
                     + ["mps", "mps:0"]
                     + [f"npu:{i}" for i in range(gpus)]
@@ -174,15 +180,12 @@ class HFLM(TemplateLM):
                             f"mps requires torch >= 2.1. You have {torch.__version__}"
                         )
                 else:
-                    eval_logger.info("Device not specified")
-                    eval_logger.info(f"Cuda Available? {torch.cuda.is_available()}")
-                    self._device = (
-                        torch.device("cuda")
-                        if torch.cuda.is_available()
-                        else torch.device("cpu")
-                    )
+                    eval_logger.info("Device not specified. Default to 'cpu'")
+                    eval_logger.info(f"Cuda GPU Available? {torch.cuda.is_available()}")
+                    eval_logger.info(f"Intel XPU Available? {torch.xpu.is_available()}")
+                    self._device = torch.device("cpu")
             else:
-                if device != "cuda":
+                if device != "cuda" and device != "xpu":
                     eval_logger.info(
                         f"Using `accelerate launch` or `parallelize=True`, device '{device}' will be overridden when placing model."
                     )
@@ -238,7 +241,7 @@ class HFLM(TemplateLM):
 
         if isinstance(pretrained, str) and (gpus >= 1 or str(self.device) == "mps"):
             # TODO: can remove this whole snippet except in the mps case, perhaps?
-            if not (parallelize or autogptq or hasattr(self, "accelerator")):
+            if not (parallelize or autogptq or hasattr(self, "accelerator") or "pipeline_parallel_stages" in kwargs):
                 # place model onto device requested manually,
                 # if not using HF Accelerate or device_map
                 # or any other option that preloads model onto device
@@ -326,6 +329,7 @@ class HFLM(TemplateLM):
                         accelerator.distributed_type
                         in [
                             DistributedType.FSDP,
+                            DistributedType.MULTI_XPU,
                             DistributedType.MULTI_GPU,
                             DistributedType.MULTI_NPU,
                         ]
@@ -445,9 +449,9 @@ class HFLM(TemplateLM):
         if backend != "default":
             # if we've settled on non-default backend, use that manually
             if backend == "causal":
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
+                self.AUTO_MODEL_CLASS = AutoModelForCausalLM
             elif backend == "seq2seq":
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForSeq2SeqLM
+                self.AUTO_MODEL_CLASS = AutoModelForSeq2SeqLM
             eval_logger.info(
                 f"Overrode HF model backend type, and using type '{backend}'"
             )
@@ -460,11 +464,11 @@ class HFLM(TemplateLM):
                 # first check if model type is listed under seq2seq models, since some
                 # models like MBart are listed in both seq2seq and causal mistakenly in HF transformers.
                 # these special cases should be treated as seq2seq models.
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForSeq2SeqLM
+                self.AUTO_MODEL_CLASS = AutoModelForSeq2SeqLM
             elif (
                 getattr(self.config, "model_type") in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
             ):
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
+                self.AUTO_MODEL_CLASS = AutoModelForCausalLM
             else:
                 if not trust_remote_code:
                     eval_logger.warning(
@@ -473,11 +477,11 @@ class HFLM(TemplateLM):
                     )
                 # if model type is neither in HF transformers causal or seq2seq model registries
                 # then we default to AutoModelForCausalLM
-                self.AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
+                self.AUTO_MODEL_CLASS = AutoModelForCausalLM
 
         assert self.AUTO_MODEL_CLASS in [
-            transformers.AutoModelForCausalLM,
-            transformers.AutoModelForSeq2SeqLM,
+            AutoModelForCausalLM,
+            AutoModelForSeq2SeqLM,
         ]
         return None
 
@@ -559,6 +563,27 @@ class HFLM(TemplateLM):
                         model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
                             model_kwargs["bnb_4bit_compute_dtype"]
                         )
+            
+            optimize_model = model_kwargs.pop("optimize_model", False)
+            if optimize_model:# or ("load_in_4bit" in model_kwargs and model_kwargs["load_in_4bit"]):
+                # model_kwargs["device_map"] = "cpu"  # FIXME: avoid GPU RAM limitation? Better load and save to continue the same pipeline!
+                if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
+                    try:
+                        from ipex_llm.transformers import AutoModelForCausalLM
+
+                        self.AUTO_MODEL_CLASS = AutoModelForCausalLM
+                    except Exception as error:
+                        raise Exception("Please, install ipex_llm!") from error
+                elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
+                    try:
+                        from ipex_llm.transformers import AutoModelForSeq2SeqLM
+
+                        self.AUTO_MODEL_CLASS = AutoModelForSeq2SeqLM
+                    except Exception as error:
+                        raise Exception("Please, install ipex_llm!") from error
+                else:
+                    raise Exception("This transformer model has not been considered yet. Please, check ipex-llm and implement!")
+                
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
@@ -694,7 +719,7 @@ class HFLM(TemplateLM):
         # if OOM, then halves batch_size and tries again
         @find_executable_batch_size(starting_batch_size=self.max_batch_size)
         def forward_batch(batch_size):
-            if self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+            if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
                 length = max(max_context_enc, max_cont_enc)
                 batched_conts = torch.ones(
                     (batch_size, length), device=self.device
@@ -745,7 +770,7 @@ class HFLM(TemplateLM):
 
         # by default for CausalLM - false or self.add_bos_token is set
         if add_special_tokens is None:
-            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+            if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
                 special_tokens_kwargs = {
                     "add_special_tokens": False or self.add_bos_token
                 }
@@ -773,7 +798,7 @@ class HFLM(TemplateLM):
         self.tokenizer.padding_side = padding_side
 
         add_special_tokens = {}
-        if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+        if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
             add_special_tokens = {"add_special_tokens": False or self.add_bos_token}
 
         encoding = self.tokenizer(
@@ -802,10 +827,10 @@ class HFLM(TemplateLM):
             [batch, sequence_ctx]. the size of sequence may vary from call to call
         :param attn_mask: torch.Tensor, optional
             A torch tensor of shape [batch, (sequence_ctx + sequence_cont)]. Only passed
-            (and must be passed) if self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM
+            (and must be passed) if self.AUTO_MODEL_CLASS is AutoModelForSeq2SeqLM
         :param labels: torch.Tensor, optional
             A torch tensor of shape [batch, (sequence_ctx + sequence_cont)]. Only passed
-            (and must be passed) if self.AUTO_MODEL_CLASS is transformers.AutoModelForSeq2SeqLM
+            (and must be passed) if self.AUTO_MODEL_CLASS is AutoModelForSeq2SeqLM
         :return
             A torch tensor of shape [batch, sequence, vocab] with the
         logits returned from the model's decoder
@@ -813,12 +838,12 @@ class HFLM(TemplateLM):
         with torch.no_grad():
             if attn_mask is not None or labels is not None:
                 assert attn_mask is not None and labels is not None
-                assert self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM
+                assert self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM"
                 return self.model(
                     input_ids=inps, attention_mask=attn_mask, labels=labels
                 ).logits
             else:
-                assert self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+                assert self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM"
                 return self.model(inps).logits
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
@@ -851,14 +876,14 @@ class HFLM(TemplateLM):
     def _select_cont_toks(
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
     ) -> torch.Tensor:
-        if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+        if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
             assert (
                 contlen and inplen
             ), "Must pass input len and cont. len to select scored logits for causal LM"
             # discard right-padding.
             # also discard the input/context tokens. we'll only score continuations.
             logits = logits[inplen - contlen : inplen]
-        elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+        elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
             assert (
                 contlen and not inplen
             ), "Selecting scored logits for Seq2SeqLM requires only cont. len"
@@ -978,7 +1003,7 @@ class HFLM(TemplateLM):
             requests,
             sort_fn=_collate,
             group_by="contexts"
-            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+            if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM"
             and self.logits_cache
             else None,
             group_fn=_lookup_one_token_cont,
@@ -1036,14 +1061,14 @@ class HFLM(TemplateLM):
                 # cont_toks      4 5 6 7 8 9      [:, -len(continuation_enc):, :self.vocab_size] slice
 
                 # when too long to fit in context, truncate from the left
-                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
                     inp = torch.tensor(
                         (context_enc + continuation_enc)[-(self.max_length + 1) :][:-1],
                         dtype=torch.long,
                         device=self.device,
                     )
                     (inplen,) = inp.shape
-                elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+                elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
                     inp = torch.tensor(
                         (context_enc)[-self.max_length :],
                         dtype=torch.long,
@@ -1083,11 +1108,11 @@ class HFLM(TemplateLM):
 
             # create encoder attn mask and batched conts, if seq2seq
             call_kwargs = {}
-            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+            if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
                 batched_inps = pad_and_concat(
                     padding_len_inp, inps, padding_side="right"
                 )  # [batch, padding_len_inp]
-            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+            elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
                 # TODO: left-pad encoder inps and mask?
                 batched_inps = pad_and_concat(
                     padding_len_inp, inps
@@ -1118,7 +1143,7 @@ class HFLM(TemplateLM):
                 # from prompt/prefix tuning tokens, if applicable
                 ctx_len = (
                     inplen + (logits.shape[0] - padding_len_inp)
-                    if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM
+                    if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM"
                     else None
                 )
                 logits = self._select_cont_toks(logits, contlen=contlen, inplen=ctx_len)
@@ -1247,10 +1272,10 @@ class HFLM(TemplateLM):
                 max_gen_toks = self.max_gen_toks
 
             # set the max length in tokens of inputs ("context_enc")
-            if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+            if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
                 # max len for inputs = max length, minus room to generate the max new tokens
                 max_ctx_len = self.max_length - max_gen_toks
-            elif self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM:
+            elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
                 # max len for inputs = encoder's whole max_length
                 max_ctx_len = self.max_length
 
@@ -1277,7 +1302,7 @@ class HFLM(TemplateLM):
             cont_toks_list = cont.tolist()
             for cont_toks, context in zip(cont_toks_list, contexts):
                 # discard context + left-padding toks if using causal decoder-only LM
-                if self.AUTO_MODEL_CLASS == transformers.AutoModelForCausalLM:
+                if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
                     cont_toks = cont_toks[context_enc.shape[1] :]
 
                 s = self.tok_decode(cont_toks)
