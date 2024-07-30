@@ -87,9 +87,14 @@ def get_git_commit_hash():
     Source: https://github.com/EleutherAI/gpt-neox/blob/b608043be541602170bfcfb8ec9bf85e8a0799e0/megatron/neox_arguments/neox_args.py#L42
     """
     try:
-        git_hash = subprocess.check_output(["git", "describe", "--always"]).strip()
-        git_hash = git_hash.decode()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+        result = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        if result.stdout.strip().decode() == 'true':
+            git_hash = subprocess.check_output(["git", "describe", "--always"]).strip()
+            git_hash = git_hash.decode()
+        else:
+            raise subprocess.CalledProcessError(1, "git")
+    except subprocess.CalledProcessError:
         # FileNotFoundError occurs when git not installed on system
         git_hash = get_commit_from_path(os.getcwd())  # git hash of repo if exists
     return git_hash
