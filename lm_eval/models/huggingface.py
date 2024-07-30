@@ -3,6 +3,9 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple, Union
+import time
+import json
+from datetime import datetime
 
 import torch
 import torch.nn.functional as F
@@ -46,7 +49,7 @@ except:
     except:
         gpus = torch.npu.device_count()
 
-from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM
+from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, BitsAndBytesConfig
 
 eval_logger = utils.eval_logger
 
@@ -126,6 +129,7 @@ class HFLM(TemplateLM):
         **kwargs,
     ) -> None:
         super().__init__()
+        self.time_stats = {"input_encoding_time": [], "input_encoding_tokens": [], "batch_size": [], "total_logits_time": [], "time_to_first_output_token": [], "total_output_time": [], "total_output_tokens": []}
 
         # optionally: take in an already-initialized transformers.PreTrainedModel
         if not isinstance(pretrained, str):
@@ -537,37 +541,26 @@ class HFLM(TemplateLM):
                     transformers.__version__ >= "4.30.0"
                 ), "load_in_4bit requires transformers >= 4.30.0"
             if transformers.__version__ >= "4.30.0":
-                if model_kwargs.get("load_in_4bit", None):
-                    if model_kwargs.get("bnb_4bit_compute_dtype", None):
-                        model_kwargs["bnb_4bit_compute_dtype"] = get_dtype(
-                            model_kwargs["bnb_4bit_compute_dtype"]
-                        )
-            
-            optimize_model = model_kwargs.pop("optimize_model", False)
-            if optimize_model:# or ("load_in_4bit" in model_kwargs and model_kwargs["load_in_4bit"]):
-                # model_kwargs["device_map"] = "cpu"  # FIXME: avoid GPU RAM limitation? Better load and save to continue the same pipeline!
-                if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
-                    try:
-                        from ipex_llm.transformers import AutoModelForCausalLM
+                load_in_4bit = model_kwargs.pop("load_in_4bit", False)
+                bnb_4bit_compute_dtype = model_kwargs.pop("bnb_4bit_compute_dtype", dtype)
+                if load_in_4bit:
+                    if bnb_4bit_compute_dtype:
+                        bnb_config = BitsAndBytesConfig(
+                                load_in_4bit=True,
+                                bnb_4bit_compute_dtype=get_dtype(bnb_4bit_compute_dtype),
+                                # bnb_4bit_use_double_quant=True,
+                            )
+                    else:
+                        bnb_config = BitsAndBytesConfig(load_in_4bit=True)
+                    model_kwargs["quantization_config"] = bnb_config
 
-                        self.AUTO_MODEL_CLASS = AutoModelForCausalLM
-                    except Exception as error:
-                        raise Exception("Please, install ipex_llm!") from error
-                elif self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM":
-                    try:
-                        from ipex_llm.transformers import AutoModelForSeq2SeqLM
-
-                        self.AUTO_MODEL_CLASS = AutoModelForSeq2SeqLM
-                    except Exception as error:
-                        raise Exception("Please, install ipex_llm!") from error
-                else:
-                    raise Exception("This transformer model has not been considered yet. Please, check ipex-llm and implement!")
-                
             self._model = self.AUTO_MODEL_CLASS.from_pretrained(
                 pretrained,
                 revision=revision,
                 torch_dtype=get_dtype(dtype),
                 trust_remote_code=trust_remote_code,
+                config=self._config,
+                low_cpu_mem_usage=True,
                 **model_kwargs,
             )
         else:
@@ -814,16 +807,20 @@ class HFLM(TemplateLM):
             A torch tensor of shape [batch, sequence, vocab] with the
         logits returned from the model's decoder
         """
-        with torch.no_grad():
+        start_time = time.time()
+        with torch.inference_mode(), torch.no_grad():
             if attn_mask is not None or labels is not None:
                 assert attn_mask is not None and labels is not None
                 assert self.AUTO_MODEL_CLASS.__name__ == "AutoModelForSeq2SeqLM"
-                return self.model(
+                result = self.model(
                     input_ids=inps, attention_mask=attn_mask, labels=labels
                 ).logits
             else:
                 assert self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM"
-                return self.model(inps).logits
+                result = self.model(inps).logits
+        elapsed_time = time.time() - start_time
+        self.time_stats["total_logits_time"].append(elapsed_time)
+        return result
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
@@ -843,7 +840,18 @@ class HFLM(TemplateLM):
         stopping_criteria = stop_sequences_criteria(
             self.tokenizer, stop, context.shape[1], context.shape[0]
         )
-        return self.model.generate(
+        time_until_first_token = None
+        def hook(module, input, output):
+            nonlocal time_until_first_token
+            if time_until_first_token is None:
+                time_until_first_token = time.time() - start_time
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            handle = self.model.model.layers[0].register_forward_hook(hook)
+        else:
+            raise AttributeError("The model does not have the expected structure with 'model.layers'")
+
+        start_time = time.time()
+        result = self.model.generate(
             input_ids=context,
             max_length=max_length,
             stopping_criteria=stopping_criteria,
@@ -851,6 +859,13 @@ class HFLM(TemplateLM):
             use_cache=True,
             **generation_kwargs,
         )
+        handle.remove()  # Remove the hook after the forward pass
+        elapsed_time = time.time() - start_time
+        self.time_stats["total_output_time"].append(elapsed_time)
+        self.time_stats["total_output_tokens"].append(result.numel())
+        if time_until_first_token is not None:
+            self.time_stats["time_to_first_output_token"].append(time_until_first_token)
+        return result
 
     def _select_cont_toks(
         self, logits: torch.Tensor, contlen: int = None, inplen: int = None
@@ -1013,6 +1028,7 @@ class HFLM(TemplateLM):
             desc="Running loglikelihood requests",
         )
         for chunk in chunks:
+            start_time = time.time()
             inps = []
             cont_toks_list = []
             inplens = []
@@ -1107,6 +1123,11 @@ class HFLM(TemplateLM):
                     "labels": batched_conts,
                 }
 
+            elapsed_time = time.time() - start_time
+            self.time_stats["input_encoding_time"].append(elapsed_time)
+            self.time_stats["input_encoding_tokens"].append(batched_inps.numel())
+            self.time_stats["batch_size"].append(batched_inps.shape[0])
+            
             multi_logits = F.log_softmax(
                 self._model_call(batched_inps, **call_kwargs), dim=-1
             )  # [batch, padding_length (inp or cont), vocab]
@@ -1162,8 +1183,16 @@ class HFLM(TemplateLM):
                     pbar.update(1)
 
         pbar.close()
+        self.save_time_stats()
 
         return re_ord.get_original(res)
+
+    def save_time_stats(self):
+        datetime_now = datetime.now().strftime("%Y%m%d_%H%M%S")
+        model_name = self.pretrained if isinstance(self.pretrained, str) else repr(self.pretrained)
+        filename = f"{utils.sanitize_model_name(model_name)}_{datetime_now}.json"
+        with open(filename, mode="w", encoding="utf-8") as fid:
+            json.dump(self.time_stats, fid, indent=4)
 
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
@@ -1219,6 +1248,7 @@ class HFLM(TemplateLM):
         )
         chunks = re_ords.get_batched(n=batch_size, batch_fn=batch_fn)
         for chunk in chunks:
+            start_time = time.time()
             contexts, all_gen_kwargs = zip(*chunk)
             # we assume all gen kwargs in the batch are the same
             # this is safe to assume because the `grouper` object ensures it.
@@ -1270,6 +1300,11 @@ class HFLM(TemplateLM):
             if "max_length" not in kwargs:
                 kwargs["max_length"] = context_enc.shape[1] + max_gen_toks
 
+            elapsed_time = time.time() - start_time
+            self.time_stats["input_encoding_time"].append(elapsed_time)
+            self.time_stats["input_encoding_tokens"].append(context_enc.numel())
+            self.time_stats["batch_size"].append(context_enc.shape[0])
+
             # perform batched generation
             cont = self._model_generate(
                 context=context_enc,
@@ -1301,7 +1336,7 @@ class HFLM(TemplateLM):
         res = re_ords.get_original(res)
 
         pbar.close()
-
+        self.save_time_stats()
         return res
 
     def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
@@ -1341,11 +1376,12 @@ class HFLM(TemplateLM):
                 )
                 return ""
 
+        pretrained = self.pretrained if isinstance(self.pretrained, str) else self.pretrained.name_or_path
         model_info = {
             "model_num_parameters": get_model_num_params(self._model),
             "model_dtype": get_model_dtype(self._model),
             "model_revision": self.revision,
-            "model_sha": get_model_sha(self.pretrained, self.revision),
+            "model_sha": get_model_sha(pretrained, self.revision),
         }
         if self.peft:
             model_info["peft_sha"] = get_model_sha(self.peft, self.revision)
