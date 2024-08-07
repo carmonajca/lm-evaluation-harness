@@ -549,6 +549,7 @@ class HFLM(TemplateLM):
         """
 
         model_kwargs = kwargs if kwargs else {}
+        optimize = model_kwargs.pop("optimize", False)
 
         model_kwargs.update(
             self._get_accelerate_args(
@@ -590,6 +591,9 @@ class HFLM(TemplateLM):
                 low_cpu_mem_usage=True,
                 **model_kwargs,
             )
+
+            if optimize:
+                self._model = ipex.optimize(self._model)
         else:
             try:
                 from auto_gptq import AutoGPTQForCausalLM
@@ -1063,7 +1067,6 @@ class HFLM(TemplateLM):
             conts = []
             encoder_attns = []
 
-            padding_len_inp = None
             padding_len_cont = None
             # because vectorizing is annoying, we first convert each (context, continuation) pair to padded
             # tensors, then we pack them together into a batch, call the model, and then pick it all apart
@@ -1118,16 +1121,11 @@ class HFLM(TemplateLM):
                         else contlen
                     )
 
-                padding_len_inp = (
-                    max(padding_len_inp, inplen)
-                    if padding_len_inp is not None
-                    else inplen
-                )
-
                 inps.append(inp)  # [1, inp_length]
                 cont_toks_list.append(continuation_enc)
                 inplens.append(inplen)
 
+            padding_len_inp = max(inplens)
             # create encoder attn mask and batched conts, if seq2seq
             call_kwargs = {}
             if self.AUTO_MODEL_CLASS.__name__ == "AutoModelForCausalLM":
