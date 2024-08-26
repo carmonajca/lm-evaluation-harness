@@ -96,7 +96,7 @@ class HFLM(TemplateLM):
         parallelize: Optional[bool] = False,
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
-        offload_folder: Optional[Union[str, os.PathLike]] = "./offload",
+        offload_folder: Optional[Union[str, os.PathLike]] = None,
         # PEFT, delta weights and quantization options
         peft: Optional[str] = None,
         delta: Optional[str] = None,
@@ -299,7 +299,7 @@ class HFLM(TemplateLM):
         device_map: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
-        offload_folder: Optional[str] = "./offload",
+        offload_folder: Optional[str] = None,
         gpus: Optional[int] = None,
     ) -> dict:
         """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
@@ -361,7 +361,8 @@ class HFLM(TemplateLM):
             if max_cpu_memory is not None:
                 max_memory["cpu"] = max_cpu_memory
 
-            args["offload_folder"] = offload_folder
+            if offload_folder is not None:
+                args["offload_folder"] = offload_folder
         elif (
             device_map is None
         ):  # No model parallelism, we use the default provided device for our model
@@ -529,7 +530,7 @@ class HFLM(TemplateLM):
         gpus: Optional[int] = None,
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
-        offload_folder: Optional[str] = "./offload",
+        offload_folder: Optional[str] = None,
         # PEFT, delta weights and quantization options
         peft: Optional[str] = None,
         delta: Optional[str] = None,
